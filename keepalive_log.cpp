@@ -31,45 +31,40 @@ enum LogMode {
     LOG_BOTH = 3
 };
 static LogMode g_mode = LOG_NONE;
-static unsigned long g_log_counter = 0;
 static std::wstring g_log_filename;
 
-// ===== 时间戳（日志内） =====
+// ===== 全局状态 =====
+std::vector<std::wstring> g_blocked;
+WCHAR g_last_device[256] = L"";
+bool g_need_restart = false;
+bool g_is_playing = false;
+bool g_playback_failed_logged = false;
+
+// ===== 时间戳 =====
 std::wstring current_time() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t buf[64];
-    swprintf_s(buf, L"[%04d/%02d/%02d - %02d:%02d:%02d] ",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    swprintf_s(buf, 64, L"[%04d/%02d/%02d - %02d:%02d:%02d] ",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     return buf;
 }
 
-// ===== 生成启动日志文件名 =====
-std::wstring generate_log_filename() {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t buf[64];
-    swprintf_s(buf, L"keepalive_%04d%02d%02d_%02d%02d%02d.txt",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return buf;
-}
-
-// ===== 写日志 =====
+// ===== 日志写入 =====
 void write_log(const std::wstring& msg) {
     if (g_mode == LOG_NONE) return;
-
     std::wstring line = current_time() + msg;
 
-    // 控制台输出
     if (g_mode & LOG_CONSOLE) {
         int len = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        std::string buf(len, 0);
-        WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, &buf[0], len, nullptr, nullptr);
-        printf("%s\n", buf.c_str());
-        fflush(stdout);
+        if (len > 0) {
+            std::string buf(len, 0);
+            WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, &buf[0], len, nullptr, nullptr);
+            printf("%s\n", buf.c_str());
+            fflush(stdout);
+        }
     }
 
-    // 文件写入（写后立即释放，不占内存）
     if ((g_mode & LOG_VERBOSE) && !g_log_filename.empty()) {
         HANDLE hFile = CreateFileW(g_log_filename.c_str(),
                                    FILE_APPEND_DATA, FILE_SHARE_READ,
@@ -77,10 +72,12 @@ void write_log(const std::wstring& msg) {
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD written = 0;
             int len = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, NULL, 0, NULL, NULL);
-            std::string utf8line(len, 0);
-            WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, &utf8line[0], len, NULL, NULL);
-            WriteFile(hFile, utf8line.c_str(), (DWORD)utf8line.size() - 1, &written, NULL);
-            WriteFile(hFile, "\r\n", 2, &written, NULL);
+            if (len > 0) {
+                std::string utf8line(len - 1, 0);
+                WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, &utf8line[0], len, NULL, NULL);
+                WriteFile(hFile, utf8line.c_str(), (DWORD)utf8line.size(), &written, NULL);
+                WriteFile(hFile, "\r\n", 2, &written, NULL);
+            }
             CloseHandle(hFile);
         }
     }
@@ -130,7 +127,7 @@ bool is_blocked_device(const WCHAR* name, const std::vector<std::wstring>& block
     return false;
 }
 
-// ===== 获取默认播放设备 =====
+// ===== 获取默认播放设备名称 =====
 bool get_default_audio_device_name(WCHAR* name, int max_len) {
     HRESULT hr;
     bool result = false;
@@ -167,26 +164,87 @@ cleanup:
     return result;
 }
 
+// ===== 设备通知回调类 =====
+class AudioNotificationClient : public IMMNotificationClient {
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *ppvObject = this;
+            return S_OK;
+        }
+        *ppvObject = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+        if (flow == eRender && role == eConsole) {
+            WCHAR cur[256];
+            if (get_default_audio_device_name(cur, 256)) {
+                write_log(L"Device changed -> " + std::wstring(cur));
+                wcscpy_s(g_last_device, cur);
+                g_need_restart = true;
+                g_playback_failed_logged = false;
+            }
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override {
+        write_log(L"Audio device removed.");
+        g_need_restart = true;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override {
+        write_log(L"Audio device state changed.");
+        g_need_restart = true;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
+
+// ===== 控制 PlaySound =====
+void start_playback() {
+    if (!g_is_playing) {
+        if (PlaySoundA((LPCSTR)wav_data, NULL, SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT)) {
+            g_is_playing = true;
+            write_log(L"Playback started.");
+        } else {
+            write_log(L"PlaySound failed!");
+        }
+    }
+}
+
+void stop_playback() {
+    if (g_is_playing) {
+        PlaySound(NULL, NULL, 0);
+        g_is_playing = false;
+        write_log(L"Playback stopped.");
+    }
+}
+
 // ===== 主入口 =====
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR lpCmdLine, int) {
     std::wstring args = lpCmdLine ? lpCmdLine : L"";
     bool has_console = args.find(L"--console") != std::wstring::npos || args.find(L"-c") != std::wstring::npos;
     bool has_verbose = args.find(L"--verbose") != std::wstring::npos || args.find(L"-v") != std::wstring::npos;
 
-    if (has_console && has_verbose)
-        g_mode = LOG_BOTH;
-    else if (has_console)
-        g_mode = LOG_CONSOLE;
-    else if (has_verbose)
-        g_mode = LOG_VERBOSE;
-    else
-        g_mode = LOG_NONE;
+    if (has_console && has_verbose) g_mode = LOG_BOTH;
+    else if (has_console) g_mode = LOG_CONSOLE;
+    else if (has_verbose) g_mode = LOG_VERBOSE;
+    else g_mode = LOG_NONE;
 
-    // 文件模式生成日志名
-    if (g_mode & LOG_VERBOSE)
-        g_log_filename = generate_log_filename();
+    if (g_mode & LOG_VERBOSE) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t buf[128];
+        swprintf_s(buf, L"keepalive_log_%04d%02d%02d_%02d%02d%02d.txt",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        g_log_filename = buf;
+    }
 
-    // 控制台初始化
     if (g_mode & LOG_CONSOLE) {
         AllocConsole();
         SetConsoleOutputCP(CP_UTF8);
@@ -198,39 +256,34 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR lpCmdLine, int) {
     }
 
     write_log(L"KeepAlive started.");
-
-    WCHAR last_device[256] = L"";
-    WCHAR cur_device[256] = L"";
-    bool is_playing = false;
-
-    auto blocked = read_blocked_devices("blocked_devices.txt");
+    g_blocked = read_blocked_devices("blocked_devices.txt");
     write_log(L"Loaded blocked device list.");
 
-    if (!PlaySoundA((LPCSTR)wav_data, NULL,
-        SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT)) {
-        write_log(L"PlaySound failed!");
-        return 1;
-    }
-    is_playing = true;
+    CoInitialize(NULL);
+    IMMDeviceEnumerator* pEnum = nullptr;
+    CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pEnum));
+
+    AudioNotificationClient client;
+    pEnum->RegisterEndpointNotificationCallback(&client);
+
+    get_default_audio_device_name(g_last_device, 256);
+    write_log(L"Initial device -> " + std::wstring(g_last_device));
+
+    // 初次播放
+    if (!is_blocked_device(g_last_device, g_blocked)) start_playback();
 
     while (true) {
-        Sleep(500);
-        if (get_default_audio_device_name(cur_device, 256)) {
-            if (wcscmp(cur_device, last_device) != 0) {
-                wcscpy_s(last_device, cur_device);
-                write_log(L"Device changed -> " + std::wstring(cur_device));
+        Sleep(200);
 
-                if (is_blocked_device(cur_device, blocked)) {
-                    write_log(L"Blocked device detected. Stop playback.");
-                    PlaySound(NULL, NULL, 0);
-                    is_playing = false;
-                } else if (!is_playing) {
-                    write_log(L"Non-blocked device. Resume playback.");
-                    PlaySoundA((LPCSTR)wav_data, NULL,
-                        SND_MEMORY | SND_ASYNC | SND_LOOP | SND_NODEFAULT);
-                    is_playing = true;
-                }
-            }
+        if (g_need_restart) {
+            stop_playback();
+            if (!is_blocked_device(g_last_device, g_blocked)) start_playback();
+            g_need_restart = false;
         }
     }
+
+    pEnum->UnregisterEndpointNotificationCallback(&client);
+    pEnum->Release();
+    CoUninitialize();
+    return 0;
 }
